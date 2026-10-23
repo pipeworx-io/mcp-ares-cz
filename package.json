@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-ares-cz",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Czech business register (ARES) — look up any Czech company or sole trader by IČO or by name, from the Ministry of Finance's official register of economic subjects.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-7687774e43f963da79bac9e3d1118d5742acf4032f15a5dcc590538f938712a8",
-    "sourceCommit": "54bf7d1c06a0775508a65d0c388dd10ba75174c3"
+    "sourceHash": "v1-dc8f75dbb2613b0f58f8ce252a6c44815b81352454d6ff7b0624a16699c0998e",
+    "sourceCommit": "93c7d52ace03a2bb9aee5e6024f6858adab0dd04"
   }
 }
