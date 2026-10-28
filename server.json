@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/ares-cz",
   "title": "Ares Cz",
-  "description": "Czech business register (ARES) — look up any Czech company or sole trader by IČO or by name, from…",
-  "version": "0.1.3",
+  "description": "Czech business register (ARES) — look up any Czech company or sole trader by IČO or by name, and…",
+  "version": "0.1.4",
   "websiteUrl": "https://pipeworx.io/packs/ares-cz",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-ares-cz",

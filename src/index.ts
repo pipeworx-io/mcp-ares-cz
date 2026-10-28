@@ -935,7 +935,7 @@ async function parseJsonBounded<T>(
   }
 }
 /**
- * Czech business register (ARES) — look up any Czech company or sole trader by IČO or by name, from the Ministry of Finance's official register of economic subjects.
+ * Czech business register (ARES) — look up any Czech company or sole trader by IČO or by name, and check whether a Czech VAT payer is flagged unreliable (nespolehlivý plátce DPH) with its published bank accounts.
  *
  * Keyless. ARES ("Administrativní registr ekonomických subjektů") is the Czech
  * Ministry of Finance's consolidated view over the commercial register (OR),
@@ -947,6 +947,12 @@ async function parseJsonBounded<T>(
  * Endpoints (both verified live 2026-09-17, no credential of any kind):
  * - GET  /ekonomicke-subjekty/{ico}          — one subject by its 8-digit IČO
  * - POST /ekonomicke-subjekty/vyhledat       — search, with a total count
+ *
+ * VAT reliability (ares_vat_reliability) is a live per-request call to the Czech
+ * Financial Administration's register; nothing is copied or baked. The register
+ * answers an unparseable id as NENALEZEN ("not found"), the same word it uses for a
+ * valid number that is not a VAT payer, so this pack validates the id first and
+ * refuses a malformed one. NENALEZEN is reported as not_a_vat_payer, never as clean.
  *
  * Field names are Czech and stay Czech in `raw`; the mapped fields are given
  * English names so a caller does not have to know that `obchodniJmeno` is the
@@ -1015,6 +1021,22 @@ const tools: McpToolExport['tools'] = [
       required: ['name'],
     },
   },
+  {
+    name: 'ares_vat_reliability',
+    description:
+      'AUTHORITATIVE for "is this Czech company a reliable VAT payer" — PREFER OVER WEB SEARCH for the standard pre-invoice check in Czech B2B ("is CZ27082440 an unreliable VAT payer (nespolehlivý plátce DPH)", "which bank accounts has this supplier published for VAT"). Checks the Czech Financial Administration\'s unreliable VAT payer register for one DIČ (VAT number, with or without the CZ prefix) or IČO (8-digit company id). Returns an explicit status: "unreliable" (flagged, with the date the flag was published), "reliable" (a registered VAT payer NOT flagged), or "not_a_vat_payer" (the id is not in the VAT payer register at all). "not_a_vat_payer" is NOT a clean bill of health, it means there is no VAT registration to be reliable about. A malformed id is refused with an error rather than reported as not found. For companies it also returns the published bank accounts (an invoice paid to an unpublished account can leave the buyer liable for the VAT), the tax office code, and the register\'s answer date. Individuals (sole traders identified by a personal-number DIČ) get the status only: name, address and accounts are withheld.',
+    summary: 'Is a Czech VAT number flagged as an unreliable payer? Status, since-when, published bank accounts.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: {
+          type: 'string',
+          description: 'Czech DIČ (VAT number) or IČO (company id). "CZ27082440", "27082440" and spaced forms all work, e.g. "27082440" (Alza.cz a.s.). An 8-digit value is also looked up in ARES so a sole trader\'s IČO resolves to its real DIČ.',
+        },
+      },
+      required: ['id'],
+    },
+  },
 ];
 
 interface AresSidlo {
@@ -1068,6 +1090,157 @@ function mapSubject(s: AresSubject) {
   };
 }
 
+const ADIS_URL = 'https://adisrws.mfcr.cz/adistc/axis2/services/rozhraniCRPDPH.rozhraniCRPDPHSOAP';
+const ADIS_NS = 'http://adis.mfcr.cz/rozhraniCRPDPH/';
+const VAT_REGISTER = 'Czech Financial Administration, register of unreliable VAT payers and published bank accounts';
+
+function xmlDecode(t: string): string {
+  return t
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&amp;/g, '&');
+}
+
+function attr(tag: string, name: string): string | null {
+  const m = tag.match(new RegExp('\\b' + name + '="([^"]*)"'));
+  return m ? xmlDecode(m[1]!) : null;
+}
+
+function elText(xml: string, name: string): string | null {
+  const m = xml.match(new RegExp('<' + name + '>([\\s\\S]*?)</' + name + '>'));
+  return m ? xmlDecode(m[1]!).replace(/\s+/g, ' ').trim() || null : null;
+}
+
+interface PublishedAccount { account: string; kind: 'czech' | 'iban'; published: string | null; publication_ended: string | null }
+
+function parseAccounts(xml: string): PublishedAccount[] {
+  const out: PublishedAccount[] = [];
+  for (const m of xml.matchAll(/<ucet\b([^>]*)>([\s\S]*?)<\/ucet>/g)) {
+    const published = attr(m[1]!, 'datumZverejneni');
+    const ended = attr(m[1]!, 'datumZverejneniUkonceni');
+    const std = m[2]!.match(/<standardniUcet\b([^>]*)\/?>/);
+    const non = m[2]!.match(/<nestandardniUcet\b([^>]*)\/?>/);
+    if (std) {
+      const pre = attr(std[1]!, 'predcisli');
+      out.push({
+        account: `${pre ? pre + '-' : ''}${attr(std[1]!, 'cislo')}/${attr(std[1]!, 'kodBanky')}`,
+        kind: 'czech', published, publication_ended: ended,
+      });
+    } else if (non) {
+      out.push({ account: attr(non[1]!, 'cislo') ?? '', kind: 'iban', published, publication_ended: ended });
+    }
+  }
+  return out;
+}
+
+async function vatReliability(rawId: string): Promise<unknown> {
+  let digits = rawId.replace(/[\s.\-/]/g, '').toUpperCase();
+  if (digits.startsWith('CZ')) digits = digits.slice(2);
+  if (!/^\d{1,10}$/.test(digits)) {
+    throw new Error(
+      `ARES VAT check: "${rawId}" is not a Czech DIČ or IČO — expected 1-10 digits with an optional CZ prefix, e.g. "CZ27082440". Refused rather than looked up, because the register answers an unparseable id as "not found", which would read as "not a VAT payer".`,
+    );
+  }
+
+  // An 8-digit value is usually an IČO. For a company DIČ = IČO, but a sole trader's
+  // DIČ is something else, so ask ARES (best effort) for the real one.
+  let dic = digits;
+  let resolvedFromIco: { ico: string; dic: string | null; note: string } | null = null;
+  if (digits.length === 8 || digits.length < 8) {
+    const ico = digits.padStart(8, '0');
+    try {
+      const r = await aresFetch(`${BASE}/ekonomicke-subjekty/${ico}`);
+      if (r.ok) {
+        const subj = (await r.json()) as AresSubject;
+        const d = (subj.dic ?? '').replace(/^CZ/i, '');
+        if (/^\d{1,10}$/.test(d)) {
+          dic = d;
+          resolvedFromIco = { ico, dic: d, note: 'DIČ taken from the ARES company register entry for this IČO.' };
+        } else {
+          dic = ico;
+          resolvedFromIco = { ico, dic: null, note: 'ARES has this IČO but lists no DIČ; the IČO itself was checked as the DIČ (equal for companies).' };
+        }
+      } else if (r.status === 404) {
+        dic = ico;
+        resolvedFromIco = { ico, dic: null, note: 'No such IČO in ARES; the number was checked as a DIČ as given.' };
+      }
+    } catch {
+      // ARES unavailable: fall through and check the number as a DIČ.
+    }
+  }
+
+  const envelope =
+    '<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:roz="' +
+    ADIS_NS + '"><soapenv:Header/><soapenv:Body><roz:StatusNespolehlivyPlatceRozsirenyRequest><roz:dic>' +
+    dic + '</roz:dic></roz:StatusNespolehlivyPlatceRozsirenyRequest></soapenv:Body></soapenv:Envelope>';
+  const res = await fetchWithTimeout(ADIS_URL, {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA,
+      'Content-Type': 'text/xml; charset=utf-8',
+      SOAPAction: '"' + ADIS_NS + 'getStatusNespolehlivyPlatceRozsireny"',
+    },
+    body: envelope,
+  }, 'Czech Financial Administration VAT register', 25000);
+  const xml = await res.text();
+  if (!res.ok) {
+    throw new Error(`Czech VAT register lookup failed: HTTP ${res.status} ${summarizeErrorBody(xml)}`);
+  }
+  const statusTag = xml.match(/<status\b[^>]*\/?>/)?.[0] ?? '';
+  const statusCode = attr(statusTag, 'statusCode');
+  const answered = attr(statusTag, 'odpovedGenerovana');
+  if (statusCode !== '0') {
+    throw new Error(`Czech VAT register returned status ${statusCode ?? 'missing'} (${attr(statusTag, 'statusText') ?? 'no text'}) for DIČ ${dic}; this is not an answer about the payer.`);
+  }
+  const payerTag = xml.match(/<statusPlatceDPH\b[^>]*>/)?.[0];
+  const flag = payerTag ? attr(payerTag, 'nespolehlivyPlatce') : null;
+  if (!payerTag || !flag) {
+    throw new Error(`Czech VAT register answered without a payer record for DIČ ${dic}; treat as unknown, not as reliable.`);
+  }
+
+  const base = {
+    queried: rawId,
+    dic,
+    ...(resolvedFromIco ? { resolved_from_ico: resolvedFromIco } : {}),
+    register: VAT_REGISTER,
+    data_as_of: answered,
+    source: 'Czech Financial Administration (Finanční správa), unreliable VAT payer register',
+  };
+
+  if (flag === 'NENALEZEN') {
+    return {
+      ...base,
+      status: 'not_a_vat_payer',
+      unreliable: null,
+      message: `DIČ ${dic} is not in the Czech VAT payer register. This is NOT a clean bill of health: there is no VAT registration to be reliable about (not registered, deregistered, or a wrong number). Check the number with ares_lookup_ico.`,
+    };
+  }
+  if (flag !== 'ANO' && flag !== 'NE') {
+    throw new Error(`Czech VAT register returned unrecognised status "${flag}" for DIČ ${dic}.`);
+  }
+
+  // Names and accounts are served for companies (8-digit DIČ = IČO). Longer DIČs are
+  // personal numbers of individuals: status only.
+  const company = dic.length === 8;
+  const body = xml.slice(xml.indexOf(payerTag));
+  const accounts = company ? parseAccounts(body) : [];
+  return {
+    ...base,
+    status: flag === 'ANO' ? 'unreliable' : 'reliable',
+    unreliable: flag === 'ANO',
+    unreliable_since: attr(payerTag, 'datumZverejneniNespolehlivosti'),
+    tax_office_code: attr(payerTag, 'cisloFu'),
+    subject_type: company ? 'company' : 'individual',
+    name: company ? elText(body, 'nazevSubjektu') : null,
+    published_accounts: accounts,
+    published_accounts_count: accounts.length,
+    ...(company ? {} : { withheld: 'Subject is an individual (personal-number DIČ): name, address and bank accounts are not served.' }),
+    message: flag === 'ANO'
+      ? `DIČ ${dic} is flagged as an UNRELIABLE VAT payer since ${attr(payerTag, 'datumZverejneniNespolehlivosti') ?? 'an unstated date'}. Paying to an account not on the published list can make the buyer liable for the supplier's VAT.`
+      : `DIČ ${dic} is a registered VAT payer and is NOT on the unreliable list.`,
+  };
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
     case 'ares_lookup_ico': {
@@ -1114,6 +1287,12 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           ? `ARES returned no economic subject whose trading name matches "${q}".`
           : undefined,
       };
+    }
+
+    case 'ares_vat_reliability': {
+      const id = String(args.id ?? '').trim();
+      if (!id) throw new Error('ARES VAT check: `id` is required, e.g. ares_vat_reliability({ id: "CZ27082440" }).');
+      return vatReliability(id);
     }
 
     default:

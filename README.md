@@ -4,7 +4,7 @@ Czech business register (ARES) — look up any Czech company or sole trader by
 IČO or by name, from the Ministry of Finance's official register of economic
 subjects.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1872+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -14,6 +14,10 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 - `ares_search_name({ name, limit, offset, onlyActive })` — subjects whose
   trading name matches, with the total match count so a precise hit is
   distinguishable from a common word.
+- `ares_vat_reliability({ id })` — is a Czech VAT payer flagged as unreliable
+  (nespolehlivý plátce DPH)? Takes a DIČ (VAT number, CZ prefix optional) or an
+  IČO. Returns an explicit `status`, the date the flag was published, the tax
+  office code, the published bank accounts and the register's answer date.
 
 ## Auth
 
@@ -23,6 +27,10 @@ Keyless. No registration, no header, no quota documented.
 
 - <https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-subjekty/{ico}> — one subject by IČO.
 - <https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-subjekty/vyhledat> — POST search, returns `pocetCelkem` (total) plus a page of subjects.
+
+- Czech Financial Administration (Finanční správa), register of unreliable VAT
+  payers and published bank accounts — queried live per request, nothing copied.
+  Reuse terms: public Czech state data, called as a client; no dataset is mirrored.
 
 ARES is the Ministry of Finance's consolidated view over the commercial
 register (OR), the trade register (RŽP), the statistical register (RES) and the
@@ -40,6 +48,19 @@ three lookups.
   clamps instead of passing through.
 - Field names in `raw` stay Czech on purpose; the mapped fields are renamed to
   English so a caller does not need to know `obchodniJmeno` is the trading name.
+
+## VAT reliability: the three answers that must not be confused
+
+- `status: "unreliable"` — flagged; `unreliable_since` is the publication date.
+- `status: "reliable"` — a registered VAT payer that is NOT flagged.
+- `status: "not_a_vat_payer"` — the number is not in the VAT payer register at
+  all (not registered, deregistered, or wrong). **Not a clean bill of health.**
+- A malformed id is an error, never a result: the register itself answers
+  "not found" to garbage, so the pack validates first.
+- Individuals (personal-number DIČ, not 8 digits) get status only; name, address and
+  bank accounts are withheld.
+- `published_accounts` is the list of accounts the payer registered for VAT; paying
+  elsewhere can make the buyer liable for the VAT.
 
 ## Quick Start
 
@@ -85,7 +106,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1872+ data sources. The
+Both URLs reach the same gateway and the same 1856+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
