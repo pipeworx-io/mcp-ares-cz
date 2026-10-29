@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/ares-cz",
   "title": "Ares Cz",
   "description": "Czech business register (ARES) — look up any Czech company or sole trader by IČO or by name, and…",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/ares-cz",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-ares-cz",
